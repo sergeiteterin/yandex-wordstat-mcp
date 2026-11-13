@@ -23,6 +23,7 @@ from .client import (
 INSTRUCTIONS = """\
 Yandex Wordstat: how often people search for a phrase in Yandex.
 - top_requests: monthly volume for a phrase plus related queries (keyword research).
+- frequencies: base and exact volume for up to 100 phrases in one call (compare wordings).
 - dynamics: how volume changes over time (seasonality, trends).
 - regions_distribution: where people search for a phrase, with an affinity index.
 - find_region: look up region IDs by name for the `regions` filters.
@@ -72,6 +73,31 @@ async def top_requests(
     containing it and similar ("associated") queries. Use for keyword research."""
     c = client()
     result = await c.top_requests(phrase, num_phrases, await c.resolve_regions(regions), _devices(devices))
+    return _dump(result)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def frequencies(
+    phrases: Annotated[
+        list[Phrase],
+        Field(min_length=1, max_length=100, description="Phrases to check, up to 7 words each."),
+    ],
+    regions: Regions = None,
+    devices: Devices = None,
+    mode: Annotated[
+        Literal["both", "exact", "base"],
+        Field(description="both = base and exact, or only one of them (half the API requests)."),
+    ] = "both",
+) -> str:
+    """Base and exact search volume over the last 30 days for a list of phrases in one call.
+    Use it to check real demand for specific wordings instead of calling top_requests per phrase.
+    `base` counts every query containing the words, so it is inflated by longer queries.
+    `exact` counts only queries made of exactly these words in these forms ("!word1 !word2") —
+    trust it when deciding whether a phrase deserves its own page. `exact_share_percent` is
+    exact / base. Each phrase costs up to 2 API requests (1 with mode "exact" or "base").
+    A phrase that fails gets an `error` field; the others are still returned."""
+    c = client()
+    result = await c.frequencies(phrases, mode, await c.resolve_regions(regions), _devices(devices))
     return _dump(result)
 
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import os
+import random
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
@@ -25,6 +27,21 @@ PERIODS = {
     "weekly": "PERIOD_WEEKLY",
     "daily": "PERIOD_DAILY",
 }
+# Rate limits (HTTP 429 or gRPC code 8) and 5xx are retried with exponential backoff.
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 1.0
+RESOURCE_EXHAUSTED = 8
+
+# frequencies(): the API tolerates 8 parallel requests; Wordstat accepts up to 7 words.
+MAX_PARALLEL = 8
+MAX_WORDS = 7
+OPERATOR_CHARS = '"!+[]()|'
+FREQUENCIES_NOTE = (
+    "base = all queries containing these words (any extra words, any word forms); "
+    "exact = queries made of exactly these words in exactly these forms, any order (\"!word1 !word2\"); "
+    "last 30 days."
+)
+
 REGION_TYPES = {
     "all": "REGION_ALL",
     "regions": "REGION_REGIONS",
@@ -35,6 +52,10 @@ REGION_TYPES = {
 class WordstatError(ToolError):
     """API error or incomplete config. Subclassing ToolError makes MCP pass the
     message to the model instead of hiding it as an unexpected crash."""
+
+
+class WordstatAuthError(WordstatError):
+    """HTTP 401/403: wrong key or missing role. Fails a whole batch, not one phrase."""
 
 
 @dataclass(frozen=True)
@@ -99,6 +120,31 @@ def _int(value: Any) -> Any:
         return value
 
 
+def phrase_words(phrase: str) -> list[str]:
+    """Words of a phrase without Wordstat operators; minus-words (-word) are dropped."""
+    strip = str.maketrans("", "", OPERATOR_CHARS)
+    words = []
+    for token in phrase.split():
+        if token.startswith("-"):
+            continue
+        word = token.translate(strip)
+        if word:
+            words.append(word)
+    return words
+
+
+def exact_query(phrase: str) -> str:
+    """`карьерный коуч` -> `"!карьерный !коуч"`: exactly these words in exactly these forms."""
+    words = phrase_words(phrase)
+    if not words:
+        raise WordstatError("Phrase has no words.")
+    if len(words) > MAX_WORDS:
+        raise WordstatError(
+            f"Phrase has {len(words)} words; Wordstat accepts at most {MAX_WORDS}. Shorten it."
+        )
+    return '"' + " ".join(f"!{w}" for w in words) + '"'
+
+
 class WordstatClient:
     def __init__(self, credentials: Credentials, http: httpx.AsyncClient | None = None):
         self._creds = credentials
@@ -111,26 +157,42 @@ class WordstatClient:
 
     async def _post(self, method: str, body: dict[str, Any]) -> dict[str, Any]:
         body = {**body, "folderId": self._creds.folder_id}
-        try:
-            resp = await self._http.post(
-                f"{BASE_URL}/{method}",
-                json=body,
-                headers={"Authorization": self._creds.auth_header()},
-            )
-        except httpx.HTTPError as exc:
-            raise WordstatError(f"Request to Wordstat API failed: {exc.__class__.__name__}") from exc
-        if resp.status_code != 200:
+        for attempt in range(RETRY_ATTEMPTS):
             try:
-                message = resp.json().get("message", resp.text)
+                resp = await self._http.post(
+                    f"{BASE_URL}/{method}",
+                    json=body,
+                    headers={"Authorization": self._creds.auth_header()},
+                )
+            except httpx.HTTPError as exc:
+                raise WordstatError(f"Request to Wordstat API failed: {exc.__class__.__name__}") from exc
+            if resp.status_code == 200:
+                return resp.json()
+            try:
+                payload = resp.json()
             except ValueError:
-                message = resp.text
-            hint = ""
+                payload = None
+            if not isinstance(payload, dict):
+                payload = {}
+            retryable = (
+                resp.status_code == 429
+                or resp.status_code >= 500
+                or payload.get("code") == RESOURCE_EXHAUSTED
+            )
+            if retryable and attempt < RETRY_ATTEMPTS - 1:
+                await asyncio.sleep(RETRY_BASE_DELAY * (2**attempt + random.random() / 2))
+                continue
+            message = payload.get("message", resp.text)
             if resp.status_code in (401, 403):
-                hint = " Check the API key and that the service account has the search-api.editor role in this folder."
-            elif resp.status_code == 400 and message == "Bad Request" and "fromDate" in body:
+                raise WordstatAuthError(
+                    f"Wordstat API error {resp.status_code}: {message}. Check the API key and "
+                    "that the service account has the search-api.editor role in this folder."
+                )
+            hint = ""
+            if resp.status_code == 400 and message == "Bad Request" and "fromDate" in body:
                 hint = " Wordstat data lags by several weeks; try an earlier from_date / to_date."
             raise WordstatError(f"Wordstat API error {resp.status_code}: {message}.{hint}")
-        return resp.json()
+        raise AssertionError("unreachable")
 
     # ---- regions -------------------------------------------------------
 
@@ -199,6 +261,75 @@ class WordstatClient:
                 for r in data.get("associations", [])
             ],
         }
+
+    async def _total_count(
+        self, query: str, regions: list[str] | None, devices: list[str] | None
+    ) -> int:
+        # Only totalCount respects operators; per-row counts in `results` are always broad.
+        body: dict[str, Any] = {"phrase": query, "numPhrases": "1"}
+        if regions:
+            body["regions"] = regions
+        if devices:
+            body["devices"] = devices
+        data = await self._post("topRequests", body)
+        count = _int(data.get("totalCount", 0))
+        if not isinstance(count, int):
+            raise WordstatError("Wordstat API returned an unexpected totalCount.")
+        return count
+
+    async def frequencies(
+        self,
+        phrases: list[str],
+        mode: str,
+        regions: list[str] | None,
+        devices: list[str] | None,
+    ) -> dict[str, Any]:
+        """Base and/or exact frequency per phrase, in input order.
+
+        A failing phrase gets an `error` field; auth errors fail the whole call.
+        """
+        kinds = ("base", "exact") if mode == "both" else (mode,)
+        semaphore = asyncio.Semaphore(MAX_PARALLEL)
+
+        async def count(query: str) -> int | str:
+            async with semaphore:
+                try:
+                    return await self._total_count(query, regions, devices)
+                except WordstatAuthError:
+                    raise
+                except WordstatError as exc:
+                    return str(exc)
+
+        async def one(phrase: str) -> dict[str, Any]:
+            row: dict[str, Any] = {"phrase": phrase}
+            try:
+                exact = exact_query(phrase)
+            except WordstatError as exc:
+                return {**row, "error": str(exc)}
+            queries = {"base": phrase.strip(), "exact": exact}
+            counts = await asyncio.gather(*(count(queries[kind]) for kind in kinds))
+            errors = []
+            for kind, value in zip(kinds, counts):
+                if isinstance(value, int):
+                    row[kind] = value
+                else:
+                    errors.append(f"{kind}: {value}")
+            if "base" in row and "exact" in row:
+                row["exact_share_percent"] = (
+                    round(row["exact"] / row["base"] * 100, 1) if row["base"] else None
+                )
+            if errors:
+                row["error"] = "; ".join(errors)
+            return row
+
+        tasks = [asyncio.ensure_future(one(p)) for p in phrases]
+        try:
+            results = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            raise
+        return {"results": list(results), "note": FREQUENCIES_NOTE}
 
     async def dynamics(
         self,
